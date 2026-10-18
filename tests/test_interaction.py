@@ -204,3 +204,50 @@ def test_stale_body_id_after_rebuild_is_safe(env):
   handler._drag_body_id = model.nbody + 5
   assert handler.apply(model, data, paused=False) is False
   assert np.all(data.xfrc_applied == 0.0)
+
+
+def test_stiffness_scale_multiplies_force(env):
+  handler, model, data = env
+  handler.stiffness_scale = 2.5
+  com = data.xipos[_BID].copy()
+  _start_drag(handler, model, data, _BID, com, com + [0.3, 0.0, 0.0])
+  handler.apply(model, data, paused=False)
+  np.testing.assert_allclose(data.xfrc_applied[_BID, :3], [150.0, 0.0, 0.0], atol=1e-6)
+
+
+def test_running_mocap_body_repositions():
+  xml = """
+  <mujoco>
+    <worldbody>
+      <body name="target" mocap="true" pos="1 0 1">
+        <geom type="sphere" size="0.1"/>
+        <body name="welded_child" pos="0 0.2 0">
+          <geom type="box" size="0.05 0.05 0.05"/>
+        </body>
+      </body>
+    </worldbody>
+  </mujoco>
+  """
+  model = mujoco.MjModel.from_xml_string(xml)
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  server = viser.ViserServer(port=0)
+  try:
+    handler = PerturbationHandler(server, model)
+    child_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "welded_child")
+    target_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target")
+    # Dragging the welded child resolves to the parent mocap body and moves mocap_pos
+    # even while unpaused (paused=False).
+    _start_drag(
+      handler,
+      model,
+      data,
+      child_bid,
+      np.array([1.0, 0.0, 1.0]),
+      np.array([2.5, -1.0, 1.5]),
+    )
+    assert handler._drag_body_id == target_bid
+    assert handler.apply(model, data, paused=False) is True
+    np.testing.assert_allclose(data.mocap_pos[0], [2.5, -1.0, 1.5], atol=1e-6)
+  finally:
+    _stop(server)

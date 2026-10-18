@@ -200,8 +200,9 @@ class Viewer:
       self._time_until_next_render = 0.0
 
     if self._dirty or self.scene.needs_update:
-      self._dirty = False
-      self._render()
+      with self._lock:
+        self._dirty = False
+        self._render()
     self._stats_frames += 1
     self._update_stats()
 
@@ -280,6 +281,7 @@ class Viewer:
   def _single_step(self) -> None:
     if self._paused:
       with self._lock:
+        self.scene.perturbation.apply(self.model, self.data, paused=False)
         self._step_fn(self.model, self.data)
         self._step_count += 1
         self._render()
@@ -367,6 +369,7 @@ class Viewer:
           def _load_keyframe() -> None:
             idx = key_names.index(key_dropdown.value)
             with self._lock:
+              self.scene.perturbation.clear()
               mujoco.mj_resetDataKeyframe(self.model, self.data, idx)
               mujoco.mj_forward(self.model, self.data)
               if self._reset_fn is not None:

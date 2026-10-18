@@ -19,16 +19,49 @@ free-joint / mocap bodies kinematically instead of applying forces.
 
 from __future__ import annotations
 
+import dataclasses
 from threading import Lock
+from typing import Literal
 
 import mujoco
 import numpy as np
 import viser
 
+from .conversions import is_fixed_body
+
 _CONNECTOR_NAME = "/perturb/connector"
 _CONNECTOR_COLOR = (255, 90, 90)
 _GHOST_NAME = "/perturb/ghost"
 _GHOST_COLOR = (255, 200, 60)
+
+DragButton = Literal["left", "middle", "right"]
+KeyModifier = Literal[
+  "cmd/ctrl",
+  "alt",
+  "shift",
+  "cmd/ctrl+alt",
+  "cmd/ctrl+shift",
+  "alt+shift",
+  "cmd/ctrl+alt+shift",
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class BodyDragEvent:
+  """Event passed to callbacks registered with ``ViserMujocoScene.on_body_drag``."""
+
+  client: viser.ClientHandle
+  phase: Literal["start", "update", "end"]
+  body_id: int
+  body_name: str
+  env_idx: int
+  mocap_id: int | None
+  start_position: tuple[float, float, float]
+  end_position: tuple[float, float, float]
+  start_screen_pos: tuple[float, float]
+  end_screen_pos: tuple[float, float]
+  button: DragButton
+  modifier: KeyModifier | None
 
 
 class PerturbationHandler:
@@ -47,6 +80,7 @@ class PerturbationHandler:
     self._lock = Lock()
 
     self.selected_body_id: int | None = None
+    self.stiffness_scale: float = 1.0
 
     # MuJoCo's perturbation state. We populate select / localpos / localmass /
     # refselpos / refpos / refquat ourselves and let MuJoCo do the physics.
@@ -57,8 +91,9 @@ class PerturbationHandler:
     self._grab_local: np.ndarray | None = None  # grab point in body-local coords
     self._target_viser: np.ndarray | None = None  # cursor target, viser frame
 
-    # Rotate drag (cmd + right-drag): a target orientation built from the
-    # camera-relative screen drag, applied as a spring torque toward it.
+    # Rotate drag (cmd + right-drag or cmd + shift + left-drag): a target
+    # orientation built from the camera-relative screen drag, applied as a
+    # spring torque toward it.
     self._drag_rotate: bool = False
     self._rotate_delta_quat: np.ndarray | None = None  # screen-driven rotation
     self._rotate_initial_quat: np.ndarray | None = None  # body orientation at start
@@ -84,11 +119,22 @@ class PerturbationHandler:
     self._ghost: viser.BoxHandle | None = None
 
   def setup_gui(self) -> None:
-    """Add a selection-info display to the GUI."""
+    """Add selection-info and perturbation stiffness controls to the GUI."""
     with self._server.gui.add_folder("Selection"):
       self._info_text = self._server.gui.add_text(
         "Body", initial_value="(none)", disabled=True
       )
+      stiffness_slider = self._server.gui.add_slider(
+        "Stiffness \u00d7",
+        min=0.1,
+        max=5.0,
+        step=0.1,
+        initial_value=self.stiffness_scale,
+      )
+
+      @stiffness_slider.on_update
+      def _(_) -> None:
+        self.stiffness_scale = float(stiffness_slider.value)
 
   def clear(self) -> None:
     """Drop selection and any in-flight drag.
@@ -120,9 +166,23 @@ class PerturbationHandler:
     self._rotate_world_quat = None
     self._pert.active = 0
 
+  def _resolve_body_id(self, bid: int | None) -> int | None:
+    """Resolve a clicked/dragged body ID, redirecting welded mocap children."""
+    if bid is None or bid <= 0 or bid >= self._model.nbody:
+      return None
+    cur = bid
+    while cur > 0 and self._model.body_jntnum[cur] == 0:
+      if self._model.body_mocapid[cur] >= 0:
+        bid = cur
+        break
+      cur = int(self._model.body_parentid[cur])
+    if is_fixed_body(self._model, bid):
+      return None
+    return bid
+
   def register_drag_handlers(
     self,
-    handle: viser.BatchedGlbHandle,
+    handle: viser.BatchedGlbHandle | viser.BatchedMeshHandle,
     body_ids: np.ndarray,
   ) -> None:
     """Attach click (select) and cmd/ctrl+drag (perturb) handlers."""
@@ -139,7 +199,7 @@ class PerturbationHandler:
       # The drag always acts on the active env (the pose we cache).
       if idx is None:
         return None
-      return int(body_ids[idx % n_bodies])
+      return self._resolve_body_id(int(body_ids[idx % n_bodies]))
 
     @handle.on_click
     def _(event: viser.SceneNodePointerEvent) -> None:  # type: ignore[type-arg]
@@ -150,13 +210,11 @@ class PerturbationHandler:
         self.selected_body_id = bid
       self._set_info(bid)
 
-    # cmd/ctrl + left-drag moves the body in the camera-facing plane. Depth
-    # (toward/away from the camera) isn't a separate gesture: viser freezes
-    # the drag modifier at drag-start and has no scroll-during-drag, so there
-    # is no fluid way to switch planes mid-drag. Orbit the view and drag again
-    # to reach a different depth.
+    # Handlers are declared ``async def`` so Viser invokes them inline on its
+    # event loop rather than submitting them to a thread pool where ``update``
+    # or ``end`` phases could race ahead of ``start``.
     @handle.on_drag("left", modifier="cmd/ctrl")
-    def _(event: viser.SceneNodeDragEvent) -> None:  # type: ignore[type-arg]
+    async def _(event: viser.SceneNodeDragEvent) -> None:  # type: ignore[type-arg]
       if event.phase == "start":
         self._on_drag_start(_body_id(event.instance_index), event.start_position)
       elif event.phase == "update":
@@ -166,11 +224,10 @@ class PerturbationHandler:
       else:  # "end"
         self._end_drag()
 
-    # cmd/ctrl + right-drag rotates the body: the screen drag builds a target
-    # orientation (yaw from horizontal motion, pitch from vertical), and the
-    # body is sprung toward it -- MuJoCo's rotate perturbation.
-    @handle.on_drag("right", modifier="cmd/ctrl")
-    def _(event: viser.SceneNodeDragEvent) -> None:  # type: ignore[type-arg]
+    # cmd/ctrl + right-drag (or cmd/ctrl + shift + left-drag for trackpads)
+    # rotates the body: the screen drag builds a target orientation (yaw from
+    # horizontal motion, pitch from vertical), and the body is sprung toward it.
+    async def _on_rotate_drag(event: viser.SceneNodeDragEvent) -> None:  # type: ignore[type-arg]
       if event.phase == "start":
         self._on_rotate_start(_body_id(event.instance_index), event.start_screen_pos)
       elif event.phase == "update":
@@ -181,6 +238,9 @@ class PerturbationHandler:
       else:  # "end"
         self._end_drag()
 
+    handle.on_drag("right", modifier="cmd/ctrl")(_on_rotate_drag)
+    handle.on_drag("left", modifier="cmd/ctrl+shift")(_on_rotate_drag)
+
   def _end_drag(self) -> None:
     with self._lock:
       self._reset_drag_state()
@@ -190,7 +250,8 @@ class PerturbationHandler:
   def _on_drag_start(
     self, bid: int | None, start_position: tuple[float, float, float]
   ) -> None:
-    if bid is None or bid == 0:
+    bid = self._resolve_body_id(bid)
+    if bid is None:
       return
     with self._lock:
       if (
@@ -214,7 +275,8 @@ class PerturbationHandler:
   def _on_rotate_start(
     self, bid: int | None, start_screen_pos: tuple[float, float]
   ) -> None:
-    if bid is None or bid == 0:
+    bid = self._resolve_body_id(bid)
+    if bid is None:
       return
     with self._lock:
       self._drag_body_id = bid
@@ -323,10 +385,10 @@ class PerturbationHandler:
       target = self._target_viser - self._scene_offset
       self._pert.localpos = self._grab_local
 
-      if paused:
+      if paused or model.body_mocapid[bid] >= 0:
         # Reposition: translate the body so the grab point reaches the
         # target, keeping orientation. mjv_applyPerturbPose moves free
-        # joints / mocap bodies and is a no-op for anything else.
+        # joints (when paused) and mocap bodies (always).
         self._clear_applied(data)
         xmat = data.xmat[bid].reshape(3, 3)
         selpos = data.xpos[bid] + xmat @ self._grab_local
@@ -335,17 +397,20 @@ class PerturbationHandler:
         self._pert.active = int(mujoco.mjtPertBit.mjPERT_TRANSLATE)
         self._pert.refpos = data.xipos[bid] + (target - selpos)
         self._pert.refquat = xiquat
-        mujoco.mjv_applyPerturbPose(model, data, self._pert, 1)
-        # mj_forward (not just mj_kinematics) so collisions, contacts, and
-        # constraint forces refresh for the dragged pose -- matches MuJoCo
-        # simulate, which runs mj_forward every frame while paused.
-        mujoco.mj_forward(model, data)
+        mujoco.mjv_applyPerturbPose(model, data, self._pert, int(paused))
+        if paused:
+          # mj_forward (not just mj_kinematics) so collisions, contacts, and
+          # constraint forces refresh for the dragged pose -- matches MuJoCo
+          # simulate, which runs mj_forward every frame while paused.
+          mujoco.mj_forward(model, data)
         return True
 
       # Running: spring force toward the cursor. localmass is MuJoCo's
-      # precomputed effective translational mass for the body.
+      # precomputed effective translational mass for the body, scaled by
+      # stiffness_scale.
       invweight = float(model.body_invweight0[bid, 0])
-      self._pert.localmass = 1.0 / invweight if invweight > 0 else 1.0
+      base_mass = 1.0 / invweight if invweight > 0 else 1.0
+      self._pert.localmass = base_mass * self.stiffness_scale
       self._pert.refselpos = target
       self._pert.active = int(mujoco.mjtPertBit.mjPERT_TRANSLATE)
       mujoco.mjv_applyPerturbForce(model, data, self._pert)
@@ -373,10 +438,11 @@ class PerturbationHandler:
     self._pert.refpos = data.xipos[bid].copy()
     self._pert.refquat = refquat
     self._pert.active = int(mujoco.mjtPertBit.mjPERT_ROTATE)
-    if paused:
+    if paused or model.body_mocapid[bid] >= 0:
       self._clear_applied(data)
-      mujoco.mjv_applyPerturbPose(model, data, self._pert, 1)
-      mujoco.mj_forward(model, data)
+      mujoco.mjv_applyPerturbPose(model, data, self._pert, int(paused))
+      if paused:
+        mujoco.mj_forward(model, data)
       return True
     mujoco.mjv_applyPerturbForce(model, data, self._pert)
     self._applied_body_id = bid
